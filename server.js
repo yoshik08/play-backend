@@ -6,7 +6,7 @@ const fs = require("fs");
 const { ObjectId } = require("mongodb");
 const spotify = require("./lib/spotify");
 const itunes = require("./lib/itunes");
-const { downloadMp3 } = require("./lib/getmp3");
+const audioService = require("./lib/audio-service");
 const { getLyrics } = require("./lib/lyrics");
 const { verifyGoogle, loginOrCreate, sign, authRequired } = require("./lib/auth");
 const { connect, getDb } = require("./lib/db");
@@ -52,7 +52,36 @@ function cleanTrack(t) {
   };
 }
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", async (req, res) => {
+  const out = { ok: true, ts: Date.now(), deps: {} };
+  // database
+  try {
+    const db = getDb();
+    await db.command({ ping: 1 });
+    out.deps.db = { ok: true };
+  } catch (e) { out.deps.db = { ok: false, reason: e.message.slice(0, 120) }; }
+  // music metadata (spotify)
+  try {
+    await spotify.search("test", "track", 1);
+    out.deps.music = { ok: true, provider: "spotify" };
+  } catch (e) { out.deps.music = { ok: false, reason: e.message.slice(0, 120) }; }
+  // audio providers
+  try {
+    out.deps.audio = await audioService.checkHealth();
+  } catch (e) { out.deps.audio = { ok: false, reason: e.message.slice(0, 120) }; }
+  // lyrics (lrcmux probe)
+  try {
+    const r = await fetch("https://lrcmux.com/api/lyrics?artist=coldplay&title=yellow", { signal: AbortSignal.timeout(8000) });
+    out.deps.lyrics = { ok: r.ok, provider: "lrcmux" };
+  } catch (e) { out.deps.lyrics = { ok: false, reason: e.message.slice(0, 120) }; }
+  // ffmpeg
+  try {
+    const { execFile } = require("child_process");
+    await new Promise((ok, no) => execFile("ffmpeg", ["-version"], { timeout: 5000 }, (e) => e ? no(e) : ok()));
+    out.deps.ffmpeg = { ok: true };
+  } catch (e) { out.deps.ffmpeg = { ok: false, reason: "not found" }; }
+  res.json(out);
+});
 
 /* ---------- search: spotify if creds exist, else itunes ---------- */
 app.get("/api/search", searchLimit, async (req, res) => {
@@ -106,26 +135,104 @@ app.get("/api/artist/:id", async (req, res) => {
   }
 });
 
-/* ---------- getmp3: download + stream the mp3 back (transient, tmp cleaned) ---------- */
-app.get("/api/getmp3", dlLimit, async (req, res) => {
-  const q = str(req.query.q, 300);
-  if (!q) return res.status(400).json({ error: "q required" });
-  let dl = null;
+/* ---------- audio: GET /api/audio/:trackId ----------
+   resolves via AudioProvider, streams audio with byte-range support.
+   the frontend player only knows this endpoint. */
+app.get("/api/audio/:trackId", dlLimit, async (req, res) => {
+  const trackId = str(req.params.trackId, 100);
+  if (!trackId) return res.status(400).json({ error: "trackId required" });
+
+  let result = null;
   try {
-    dl = await downloadMp3(q);
-    const stat = fs.statSync(dl.path);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader("Cache-Control", "public, max-age=31536000");
-    const stream = fs.createReadStream(dl.path);
-    stream.on("close", () => dl.cleanup());
-    stream.on("error", () => dl.cleanup());
-    stream.pipe(res);
+    result = await audioService.getAudio(trackId);
   } catch (e) {
-    if (dl) dl.cleanup();
-    console.log("getmp3 failed:", e.message);
-    res.status(502).json({ error: "playback unavailable for this track" });
+    console.log("audio resolve failed:", trackId, e.message);
+    return res.status(502).json({ error: "playback unavailable for this track", reason: "resolve failed" });
   }
+
+  const { track, src } = result;
+  if (!src.available) {
+    console.log("audio unavailable:", trackId, src.reason);
+    return res.status(502).json({ error: "playback unavailable for this track", reason: src.reason, stage: src.stage });
+  }
+
+  // file-based source (youtube provider): stream from disk with ranges
+  if (src.filePath) {
+    let stat;
+    try { stat = fs.statSync(src.filePath); }
+    catch (e) { src.cleanup && src.cleanup(); return res.status(502).json({ error: "audio file lost" }); }
+    const total = stat.size;
+    const range = req.headers.range;
+    res.setHeader("Content-Type", src.mimeType || "audio/mpeg");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("X-Audio-Provider", src.provider);
+    if (src.isPreview) res.setHeader("X-Audio-Preview", "1");
+
+    const cleanup = () => { try { src.cleanup && src.cleanup(); } catch (e) {} };
+    if (range) {
+      const m = range.match(/bytes=(\d*)-(\d*)/);
+      if (!m) { cleanup(); return res.status(416).end(); }
+      let start = m[1] ? parseInt(m[1], 10) : 0;
+      let end = m[2] ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start) || isNaN(end) || start >= total || end >= total || start > end) {
+        cleanup(); res.setHeader("Content-Range", `bytes */${total}`); return res.status(416).end();
+      }
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+      res.setHeader("Content-Length", end - start + 1);
+      const stream = fs.createReadStream(src.filePath, { start, end });
+      stream.on("close", cleanup); stream.on("error", cleanup);
+      return stream.pipe(res);
+    }
+    res.setHeader("Content-Length", total);
+    const stream = fs.createReadStream(src.filePath);
+    stream.on("close", cleanup); stream.on("error", cleanup);
+    return stream.pipe(res);
+  }
+
+  // url-based source (spotify preview): redirect to the cdn url.
+  // the browser fetches directly; spotify's cdn supports ranges.
+  if (src.url) {
+    res.setHeader("X-Audio-Provider", src.provider);
+    if (src.isPreview) res.setHeader("X-Audio-Preview", "1");
+    return res.redirect(302, src.url);
+  }
+
+  return res.status(502).json({ error: "playback unavailable for this track", reason: "no usable source" });
+});
+
+/* ---------- audio diagnostics: proves exactly which stage fails ---------- */
+app.get("/api/audio/debug/:trackId", async (req, res) => {
+  const trackId = str(req.params.trackId, 100);
+  const out = { trackId, stages: {} };
+  const t0 = Date.now();
+  try {
+    // 1. track exists
+    const track = await audioService.resolveTrack(trackId);
+    out.stages.track = { ok: true, title: track.title, artist: track.artist, source: track.source };
+    // 2-5. provider resolution per provider
+    out.stages.providers = {};
+    for (const p of audioService.provider.providers) {
+      const s0 = Date.now();
+      try {
+        const src = await p.getPlayableSource(track);
+        out.stages.providers[p.name] = {
+          ok: src.available,
+          ms: Date.now() - s0,
+          reason: src.available ? null : src.reason,
+          stage: src.stage || null,
+          mimeType: src.mimeType || null,
+          isPreview: !!src.isPreview,
+        };
+      } catch (e) {
+        out.stages.providers[p.name] = { ok: false, ms: Date.now() - s0, reason: "threw: " + e.message.slice(0, 200) };
+      }
+    }
+  } catch (e) {
+    out.stages.track = { ok: false, reason: e.message.slice(0, 200) };
+  }
+  out.ms = Date.now() - t0;
+  res.json(out);
 });
 
 /* ---------- lyrics ---------- */
