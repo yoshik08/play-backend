@@ -262,6 +262,240 @@ app.get("/api/me", authRequired, (req, res) => {
   res.json({ user: { email: req.user.email, name: req.user.name, pic: req.user.pic } });
 });
 
+/* ---------- drive oauth ---------- */
+const drive = require("./lib/drive");
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100mb
+
+app.post("/api/auth/google/drive", authRequired, async (req, res) => {
+  try {
+    const code = str(req.body.code, 2000);
+    const redirectUri = str(req.body.redirectUri, 500);
+    if (!code) return res.status(400).json({ error: "code required" });
+    const tokens = await drive.exchangeCode(code, redirectUri);
+    const update = { driveConnectedAt: new Date() };
+    if (tokens.refreshToken) update.driveRefresh = tokens.refreshToken;
+    await getDb().collection("users").updateOne(
+      { _id: new ObjectId(req.user.uid) },
+      { $set: update }
+    );
+    res.json({ ok: true, connected: true });
+  } catch (e) {
+    console.log("drive connect failed:", e.message);
+    res.status(500).json({ error: "drive connect failed" });
+  }
+});
+
+app.get("/api/drive/status", authRequired, async (req, res) => {
+  res.json({ connected: await drive.isConnected(req.user.uid) });
+});
+
+/* ---------- songs: personal library ---------- */
+const songsColl = () => getDb().collection("songs");
+
+// ensure index
+async function ensureSongIndexes() {
+  try {
+    await songsColl().createIndex({ userId: 1, createdAt: -1 });
+  } catch (e) {}
+}
+ensureSongIndexes();
+
+function songToJson(doc) {
+  return {
+    id: String(doc._id),
+    name: doc.name,
+    originalFilename: doc.originalFilename,
+    mimeType: doc.mimeType,
+    size: doc.size,
+    duration: doc.duration,
+    spotifyMatch: doc.spotifyMatch || null,
+    lyrics: doc.lyrics ? {
+      text: doc.lyrics.text || null,
+      source: doc.lyrics.source || null,
+      synced: !!doc.lyrics.synced,
+    } : null,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+}
+
+// POST /api/songs — upload audio file
+app.post("/api/songs", authRequired, upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "audio file required" });
+    const uid = req.user.uid;
+
+    // drive must be connected
+    const accessToken = await drive.getAccessToken(uid);
+    const folderId = await drive.ensureFolder(accessToken);
+
+    // upload to drive
+    const { fileId, size } = await drive.uploadFile(
+      accessToken, folderId,
+      req.file.originalname, req.file.mimetype, req.file.buffer
+    );
+
+    // create song doc (metadata only, no spotify/lyrics yet — frontend does naming flow)
+    const now = new Date();
+    const doc = {
+      userId: uid,
+      name: req.body.name || req.file.originalname.replace(/\.[^.]+$/, ""),
+      originalFilename: req.file.originalname,
+      driveFileId: fileId,
+      mimeType: req.file.mimetype,
+      size: size || req.file.size,
+      duration: parseFloat(req.body.duration) || 0,
+      spotifyMatch: null,
+      lyrics: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const r = await songsColl().insertOne(doc);
+    res.json(songToJson({ ...doc, _id: r.insertedId }));
+  } catch (e) {
+    console.log("song upload failed:", e.message);
+    res.status(500).json({ error: "upload failed: " + e.message.slice(0, 100) });
+  }
+});
+
+// GET /api/songs — list user's songs
+app.get("/api/songs", authRequired, async (req, res) => {
+  const docs = await songsColl().find({ userId: req.user.uid }).sort({ createdAt: -1 }).toArray();
+  res.json({ songs: docs.map(songToJson) });
+});
+
+// GET /api/songs/:id — get one (ownership enforced)
+app.get("/api/songs/:id", authRequired, async (req, res) => {
+  let doc;
+  try {
+    doc = await songsColl().findOne({ _id: new ObjectId(req.params.id), userId: req.user.uid });
+  } catch (e) { return res.status(400).json({ error: "bad id" }); }
+  if (!doc) return res.status(404).json({ error: "not found" });
+  // include full lyrics for detail view
+  const out = songToJson(doc);
+  if (doc.lyrics && doc.lyrics.rawLrc) out.lyrics.rawLrc = doc.lyrics.rawLrc;
+  res.json(out);
+});
+
+// PATCH /api/songs/:id — rename / update metadata
+app.patch("/api/songs/:id", authRequired, async (req, res) => {
+  const updates = {};
+  if (req.body.name) updates.name = str(req.body.name, 200);
+  if (req.body.spotifyMatch) updates.spotifyMatch = req.body.spotifyMatch;
+  if (req.body.lyrics) updates.lyrics = req.body.lyrics;
+  if (!Object.keys(updates).length) return res.status(400).json({ error: "nothing to update" });
+  updates.updatedAt = new Date();
+
+  let r;
+  try {
+    r = await songsColl().findOneAndUpdate(
+      { _id: new ObjectId(req.params.id), userId: req.user.uid },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+  } catch (e) { return res.status(400).json({ error: "bad id" }); }
+  if (!r.value) return res.status(404).json({ error: "not found" });
+  res.json(songToJson(r.value));
+});
+
+// DELETE /api/songs/:id — delete from drive + mongo
+app.delete("/api/songs/:id", authRequired, async (req, res) => {
+  let doc;
+  try {
+    doc = await songsColl().findOne({ _id: new ObjectId(req.params.id), userId: req.user.uid });
+  } catch (e) { return res.status(400).json({ error: "bad id" }); }
+  if (!doc) return res.status(404).json({ error: "not found" });
+
+  // delete from drive
+  try {
+    const accessToken = await drive.getAccessToken(req.user.uid);
+    await drive.deleteFile(accessToken, doc.driveFileId);
+  } catch (e) {
+    console.log("drive delete failed (continuing):", e.message);
+  }
+  await songsColl().deleteOne({ _id: doc._id });
+  res.json({ ok: true });
+});
+
+// GET /api/songs/:id/audio — stream with range support (ownership enforced)
+app.get("/api/songs/:id/audio", authRequired, async (req, res) => {
+  let doc;
+  try {
+    doc = await songsColl().findOne({ _id: new ObjectId(req.params.id), userId: req.user.uid });
+  } catch (e) { return res.status(400).json({ error: "bad id" }); }
+  if (!doc) return res.status(404).json({ error: "not found" });
+
+  try {
+    const accessToken = await drive.getAccessToken(req.user.uid);
+    const range = req.headers.range;
+    const dl = await drive.getFileStream(accessToken, doc.driveFileId, range);
+
+    res.setHeader("Content-Type", dl.mimeType || doc.mimeType || "audio/mpeg");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    if (dl.status === 206) {
+      res.status(206);
+      if (dl.contentRange) res.setHeader("Content-Range", dl.contentRange);
+    }
+    if (dl.contentLength) res.setHeader("Content-Length", dl.contentLength);
+
+    // pipe web stream to express response
+    const reader = dl.stream.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.write(value)) await new Promise((r) => res.once("drain", r));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    res.end();
+  } catch (e) {
+    console.log("audio stream failed:", e.message);
+    if (!res.headersSent) res.status(502).json({ error: "audio unavailable" });
+  }
+});
+
+// POST /api/songs/:id/lyrics/refresh — re-fetch lyrics
+app.post("/api/songs/:id/lyrics/refresh", authRequired, async (req, res) => {
+  let doc;
+  try {
+    doc = await songsColl().findOne({ _id: new ObjectId(req.params.id), userId: req.user.uid });
+  } catch (e) { return res.status(400).json({ error: "bad id" }); }
+  if (!doc) return res.status(404).json({ error: "not found" });
+
+  try {
+    const { getLyrics } = require("./lib/lyrics");
+    const artist = (doc.spotifyMatch && doc.spotifyMatch.artist) || "";
+    const title = (doc.spotifyMatch && doc.spotifyMatch.title) || doc.name;
+    const result = await getLyrics(artist, title, doc.duration);
+    let lyrics = { text: null, source: null, synced: false, rawLrc: null };
+    if (result && result.source !== "none") {
+      lyrics.source = result.source;
+      lyrics.synced = !!result.wordSync;
+      if (result.lines && result.lines.length) {
+        // store as LRC text for the player
+        lyrics.rawLrc = result.lines.map((l) => {
+          const m = Math.floor(l.time / 60), s = (l.time % 60).toFixed(2).padStart(5, "0");
+          return `[${String(m).padStart(2, "0")}:${s}]${l.text}`;
+        }).join("\n");
+        lyrics.text = result.lines.map((l) => l.text).join("\n");
+      } else if (result.plain) {
+        lyrics.text = result.plain;
+      }
+    }
+    await songsColl().updateOne({ _id: doc._id }, { $set: { lyrics, updatedAt: new Date() } });
+    const out = { ...lyrics };
+    delete out.rawLrc; // don't send raw in list, detail endpoint includes it
+    res.json({ lyrics: out });
+  } catch (e) {
+    console.log("lyrics refresh failed:", e.message);
+    res.status(500).json({ error: "lyrics refresh failed" });
+  }
+});
+
 /* ---------- liked songs ---------- */
 app.get("/api/liked", authRequired, async (req, res) => {
   const docs = await getDb().collection("liked").find({ owner: req.user.uid }).sort({ at: -1 }).toArray();
