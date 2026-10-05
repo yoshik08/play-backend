@@ -258,6 +258,28 @@ app.post("/api/auth/google", async (req, res) => {
     res.status(401).json({ error: "google auth failed" });
   }
 });
+/* redirect-flow: exchange oauth code for session (reliable on ios) */
+app.post("/api/auth/google/code", async (req, res) => {
+  try {
+    const code = str(req.body.code, 2000);
+    const redirectUri = str(req.body.redirectUri, 500);
+    if (!code || !redirectUri) return res.status(400).json({ error: "code and redirectUri required" });
+    const { OAuth2Client } = require("google-auth-library");
+    const client = new OAuth2Client(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      redirectUri
+    );
+    const { tokens } = await client.getToken(code);
+    if (!tokens.id_token) return res.status(401).json({ error: "no id token" });
+    const profile = await verifyGoogle(tokens.id_token);
+    const user = await loginOrCreate(profile);
+    res.json({ token: sign(user), user: { email: user.email, name: user.name, pic: user.pic } });
+  } catch (e) {
+    console.log("google code exchange failed:", e.message);
+    res.status(401).json({ error: "google auth failed" });
+  }
+});
 app.get("/api/me", authRequired, (req, res) => {
   res.json({ user: { email: req.user.email, name: req.user.name, pic: req.user.pic } });
 });
