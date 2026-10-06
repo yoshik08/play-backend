@@ -396,6 +396,90 @@ app.put("/api/preferences", authRequired, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------- playlists ---------- */
+function playlistsColl() { return getDb().collection("playlists"); }
+
+app.post("/api/playlists", authRequired, async (req, res) => {
+  const name = str(req.body.name, 100) || "new playlist";
+  const doc = {
+    userId: req.user.uid,
+    name,
+    songIds: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const r = await playlistsColl().insertOne(doc);
+  res.json({ id: String(r.insertedId), name, songIds: [] });
+});
+
+app.get("/api/playlists", authRequired, async (req, res) => {
+  const docs = await playlistsColl().find({ userId: req.user.uid }).sort({ createdAt: -1 }).maxTimeMS(5000).toArray();
+  res.json({ playlists: docs.map((d) => ({ id: String(d._id), name: d.name, songCount: (d.songIds || []).length })) });
+});
+
+app.get("/api/playlists/:id", authRequired, async (req, res) => {
+  let _id;
+  try { _id = new ObjectId(req.params.id); }
+  catch (e) { return res.status(400).json({ error: "bad id" }); }
+  const pl = await playlistsColl().findOne({ _id, userId: req.user.uid }, { maxTimeMS: 5000 });
+  if (!pl) return res.status(404).json({ error: "not found" });
+  // fetch songs
+  const songIds = (pl.songIds || []).map((id) => { try { return new ObjectId(id); } catch (e) { return null; } }).filter(Boolean);
+  const songs = songIds.length ? await songsColl().find({ _id: { $in: songIds } }).toArray() : [];
+  const songMap = new Map(songs.map((s) => [String(s._id), songToJson(s)]));
+  const ordered = (pl.songIds || []).map((id) => songMap.get(String(id))).filter(Boolean);
+  res.json({ id: String(pl._id), name: pl.name, songs: ordered });
+});
+
+app.patch("/api/playlists/:id", authRequired, async (req, res) => {
+  let _id;
+  try { _id = new ObjectId(req.params.id); }
+  catch (e) { return res.status(400).json({ error: "bad id" }); }
+  const name = str(req.body.name, 100);
+  if (!name) return res.status(400).json({ error: "name required" });
+  const r = await playlistsColl().updateOne({ _id, userId: req.user.uid }, { $set: { name, updatedAt: new Date() } });
+  if (!r.matchedCount) return res.status(404).json({ error: "not found" });
+  res.json({ ok: true, name });
+});
+
+app.delete("/api/playlists/:id", authRequired, async (req, res) => {
+  let _id;
+  try { _id = new ObjectId(req.params.id); }
+  catch (e) { return res.status(400).json({ error: "bad id" }); }
+  await playlistsColl().deleteOne({ _id, userId: req.user.uid });
+  res.json({ ok: true });
+});
+
+app.post("/api/playlists/:id/songs", authRequired, async (req, res) => {
+  let _id;
+  try { _id = new ObjectId(req.params.id); }
+  catch (e) { return res.status(400).json({ error: "bad id" }); }
+  const songId = str(req.body.songId, 50);
+  if (!songId) return res.status(400).json({ error: "songId required" });
+  // verify song exists and user owns it
+  let songOid;
+  try { songOid = new ObjectId(songId); }
+  catch (e) { return res.status(400).json({ error: "bad songId" }); }
+  const song = await songsColl().findOne({ _id: songOid, userId: req.user.uid });
+  if (!song) return res.status(404).json({ error: "song not found" });
+  await playlistsColl().updateOne(
+    { _id, userId: req.user.uid },
+    { $addToSet: { songIds: songId }, $set: { updatedAt: new Date() } }
+  );
+  res.json({ ok: true });
+});
+
+app.delete("/api/playlists/:id/songs/:songId", authRequired, async (req, res) => {
+  let _id;
+  try { _id = new ObjectId(req.params.id); }
+  catch (e) { return res.status(400).json({ error: "bad id" }); }
+  await playlistsColl().updateOne(
+    { _id, userId: req.user.uid },
+    { $pull: { songIds: req.params.songId }, $set: { updatedAt: new Date() } }
+  );
+  res.json({ ok: true });
+});
+
 /* ---------- errors ---------- */
 app.use((req, res) => res.status(404).json({ error: "not found" }));
 app.use((err, req, res, next) => {
