@@ -178,7 +178,6 @@ async function ensureSongIndexes() {
     await songsColl().createIndex({ userId: 1, createdAt: -1 });
   } catch (e) {}
 }
-ensureSongIndexes();
 
 function songToJson(doc) {
   return {
@@ -203,7 +202,7 @@ function findSong(req, res, next) {
   let _id;
   try { _id = new ObjectId(req.params.id); }
   catch (e) { return res.status(400).json({ error: "bad id" }); }
-  songsColl().findOne({ _id, userId: req.user.uid })
+  songsColl().findOne({ _id, userId: req.user.uid }, { maxTimeMS: 5000 })
     .then((doc) => {
       if (!doc) return res.status(404).json({ error: "not found" });
       req.song = doc;
@@ -406,7 +405,8 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
-  connect().then(() => {
+  connect().then(async () => {
+    await ensureSongIndexes();
     app.listen(PORT, () => console.log("play backend on :" + PORT));
   }).catch((e) => {
     console.error("db connect failed:", e.message);
