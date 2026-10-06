@@ -229,6 +229,37 @@ async function main() {
     assert(pr.status === 404, `POST /api/drive/reconnect should 404, got ${pr.status}`);
   });
 
+  await t("drive lib: getAccessToken uses env creds (no ReferenceError)", async () => {
+    // load the REAL lib/drive, bypassing the stub
+    const realDrive = origRequire.call(module, "../lib/drive.js");
+    // set fake google creds so clientCreds() doesn't throw first
+    const savedId = process.env.GOOGLE_CLIENT_ID;
+    const savedSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const savedRefresh = process.env.DRIVE_REFRESH_TOKEN;
+    process.env.GOOGLE_CLIENT_ID = "fake-id";
+    process.env.GOOGLE_CLIENT_SECRET = "fake-secret";
+    // missing refresh token → clean "not connected" error, not ReferenceError
+    delete process.env.DRIVE_REFRESH_TOKEN;
+    try {
+      await realDrive.getAccessToken();
+      assert(false, "should have thrown");
+    } catch (e) {
+      assert(e.message.includes("drive not connected"), "wrong error: " + e.message);
+      assert(!e.message.includes("is not defined"), "ReferenceError: " + e.message);
+    }
+    // with fake refresh token → should attempt network (fail), not ReferenceError
+    process.env.DRIVE_REFRESH_TOKEN = "fake-refresh";
+    try {
+      await realDrive.getAccessToken();
+    } catch (e) {
+      assert(!e.message.includes("is not defined"), "ReferenceError: " + e.message);
+    }
+    // restore
+    if (savedId) process.env.GOOGLE_CLIENT_ID = savedId;
+    if (savedSecret) process.env.GOOGLE_CLIENT_SECRET = savedSecret; else delete process.env.GOOGLE_CLIENT_SECRET;
+    if (savedRefresh) process.env.DRIVE_REFRESH_TOKEN = savedRefresh; else delete process.env.DRIVE_REFRESH_TOKEN;
+  });
+
   await t("404 json", async () => {
     const r = await req("GET", "/nope");
     assert(r.status === 404 && r.json.error, "want json 404");
