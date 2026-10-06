@@ -266,8 +266,13 @@ app.post("/api/songs", authRequired, uploadLimit, upload.single("audio"), async 
 
 /* GET /api/songs — list my songs */
 app.get("/api/songs", authRequired, async (req, res) => {
-  const docs = await songsColl().find({ userId: req.user.uid }).sort({ createdAt: -1 }).toArray();
-  res.json({ songs: docs.map(songToJson) });
+  try {
+    const docs = await songsColl().find({ userId: req.user.uid }).sort({ createdAt: -1 }).maxTimeMS(5000).toArray();
+    res.json({ songs: docs.map(songToJson) });
+  } catch (e) {
+    console.error("GET /api/songs failed:", e.message);
+    res.status(500).json({ error: "failed to load library" });
+  }
 });
 
 /* GET /api/songs/:id — one song (ownership enforced) */
