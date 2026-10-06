@@ -287,9 +287,13 @@ app.patch("/api/songs/:id", authRequired, findSong, async (req, res) => {
   if (req.body.name) updates.name = str(req.body.name, 200);
   if (req.body.spotifyMatch && typeof req.body.spotifyMatch === "object") {
     const m = req.body.spotifyMatch;
+    const prev = req.song.spotifyMatch || {};
+    // MERGE: only overwrite fields that are provided, preserve the rest
     updates.spotifyMatch = {
-      title: str(m.title, 200), artist: str(m.artist, 200),
-      album: str(m.album, 200), artworkUrl: str(m.artworkUrl, 500),
+      title: m.title !== undefined ? str(m.title, 200) : (prev.title || ""),
+      artist: m.artist !== undefined ? str(m.artist, 200) : (prev.artist || ""),
+      album: m.album !== undefined ? str(m.album, 200) : (prev.album || ""),
+      artworkUrl: m.artworkUrl !== undefined ? str(m.artworkUrl, 500) : (prev.artworkUrl || ""),
     };
   }
   if (!Object.keys(updates).length) return res.status(400).json({ error: "nothing to update" });
