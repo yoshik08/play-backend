@@ -1,19 +1,55 @@
 // api tests: node test/run.js
-// spins up the app with an in-memory mongo stub. no framework.
+// spins up the app with an in-memory mongo stub + drive stub. no framework.
 process.env.MONGODB_URI = "stub";
 process.env.JWT_SECRET = "test-secret";
 process.env.GOOGLE_CLIENT_ID = "test.apps.googleusercontent.com";
 
 const Module = require("module");
 const stubPath = require.resolve("./mongo-stub");
-const origResolve = Module._resolveFilename;
 require.cache[stubPath] = { exports: require("./mongo-stub") };
-// force lib/db to resolve to the stub
-const dbRealPath = require.resolve("../lib/db");
+
+// drive stub: no network, no google
+const driveStub = {
+  FOLDER_NAME: "yoshik-play",
+  async saveRefreshToken() { return true; },
+  async getAccessToken() { return "stub-access"; },
+  async checkConnection() { return true; },
+  async ensureFolder() { return "folder123"; },
+  async uploadFile(at, folderId, filename, mimeType, filePath, fileSize) {
+    return { fileId: "drive123", size: fileSize };
+  },
+  async getFileStream(at, fileId, rangeHeader) {
+    const bytes = new TextEncoder().encode("FAKEAUDIO".repeat(1000));
+    let status = 200, contentRange = null, body = bytes;
+    if (rangeHeader) {
+      const m = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+      const start = m[1] ? parseInt(m[1], 10) : 0;
+      const end = m[2] ? parseInt(m[2], 10) : bytes.length - 1;
+      body = bytes.slice(start, end + 1);
+      status = 206;
+      contentRange = `bytes ${start}-${end}/${bytes.length}`;
+    }
+    return {
+      stream: new ReadableStream({
+        start(c) { c.enqueue(body); c.close(); },
+      }),
+      status,
+      contentLength: String(body.length),
+      contentRange,
+      mimeType: "audio/mpeg",
+    };
+  },
+  async deleteFile() {},
+};
+
+// force lib/db and lib/drive to resolve to the stubs
 const origRequire = Module.prototype.require;
 Module.prototype.require = function (id) {
   if (id === "./lib/db" || id === "../lib/db" || id.endsWith("lib/db")) {
     return require("./mongo-stub");
+  }
+  if (id === "./lib/drive" || id === "../lib/drive" || id.endsWith("lib/drive")) {
+    return driveStub;
   }
   return origRequire.apply(this, arguments);
 };
@@ -25,17 +61,23 @@ const PORT = 4317;
 let server, passed = 0, failed = 0, skipped = 0;
 const results = [];
 
-async function req(method, path, body, token) {
-  const headers = { "Content-Type": "application/json" };
+async function req(method, path, body, token, form) {
+  const headers = {};
   if (token) headers.Authorization = "Bearer " + token;
-  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let r;
+  if (form) {
+    r = await fetch(`http://127.0.0.1:${PORT}${path}`, { method, headers, body: form });
+  } else {
+    headers["Content-Type"] = "application/json";
+    r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
   let json = null;
   try { json = await r.json(); } catch (e) {}
-  return { status: r.status, json };
+  return { status: r.status, json, headers: r.headers };
 }
 
 function t(name, fn) {
@@ -47,7 +89,7 @@ function t(name, fn) {
 function assert(cond, msg) { if (!cond) throw new Error(msg || "assertion failed"); }
 const uid = "user123";
 const token = jwt.sign({ uid, email: "t@t.com", name: "t", pic: "" }, "test-secret");
-const track = { id: "it:1", title: "song", artist: "art", artists: "art", album: "alb", albumArt: "", duration: 200, externalId: "1", source: "itunes" };
+const token2 = jwt.sign({ uid: "user999", email: "o@o.com", name: "o", pic: "" }, "test-secret");
 
 async function main() {
   server = app.listen(PORT);
@@ -56,10 +98,11 @@ async function main() {
   await t("health", async () => {
     const r = await req("GET", "/health");
     assert(r.status === 200 && r.json.ok, "health not ok");
+    assert(r.json.deps.db && r.json.deps.drive, "missing deps");
   });
 
   await t("protected routes 401 without token", async () => {
-    for (const [m, p] of [["GET", "/api/liked"], ["GET", "/api/playlists"], ["GET", "/api/history"], ["GET", "/api/me"], ["GET", "/api/preferences"]]) {
+    for (const [m, p] of [["GET", "/api/me"], ["GET", "/api/preferences"], ["GET", "/api/songs"], ["GET", "/api/drive/status"]]) {
       const r = await req(m, p);
       assert(r.status === 401, `${m} ${p} → ${r.status}, want 401`);
     }
@@ -75,77 +118,68 @@ async function main() {
     assert(r.status === 200 && r.json.user.email === "t@t.com", "me failed");
   });
 
-  await t("likes: add + duplicate-prevention", async () => {
-    await req("POST", "/api/liked", { track }, token);
-    await req("POST", "/api/liked", { track }, token); // dup
-    const r = await req("GET", "/api/liked", null, token);
-    assert(r.json.tracks.length === 1, "dup like created: " + r.json.tracks.length);
-    await req("DELETE", "/api/liked/it:1", null, token);
-    const r2 = await req("GET", "/api/liked", null, token);
-    assert(r2.json.tracks.length === 0, "unlike failed");
+  let songId;
+  await t("songs: upload (multipart)", async () => {
+    const form = new FormData();
+    form.append("audio", new Blob(["FAKEAUDIO".repeat(100)], { type: "audio/mpeg" }), "test.mp3");
+    form.append("duration", "12.5");
+    form.append("name", "Test Song");
+    const r = await req("POST", "/api/songs", null, token, form);
+    assert(r.status === 200, "upload failed: " + r.status + " " + JSON.stringify(r.json));
+    assert(r.json.id && r.json.name === "Test Song", "bad song json");
+    assert(r.json.duration === 12.5, "duration not stored");
+    songId = r.json.id;
   });
 
-  await t("likes: reject invalid track", async () => {
-    const r = await req("POST", "/api/liked", { track: { nope: 1 } }, token);
-    assert(r.status === 400, "want 400");
+  await t("songs: list + get (ownership)", async () => {
+    const l = await req("GET", "/api/songs", null, token);
+    assert(l.json.songs.length === 1 && l.json.songs[0].id === songId, "list wrong");
+    const g = await req("GET", "/api/songs/" + songId, null, token);
+    assert(g.status === 200 && g.json.name === "Test Song", "get failed");
+    const other = await req("GET", "/api/songs/" + songId, null, token2);
+    assert(other.status === 404, "cross-user read should 404, got " + other.status);
   });
 
-  let pid;
-  await t("playlists: create + get", async () => {
-    const r = await req("POST", "/api/playlists", { name: "mix" }, token);
-    assert(r.status === 200 && r.json.id, "no id");
-    pid = r.json.id;
-    const g = await req("GET", "/api/playlists/" + pid, null, token);
-    assert(g.json.playlist.name === "mix", "name mismatch");
+  await t("songs: patch rename", async () => {
+    const r = await req("PATCH", "/api/songs/" + songId, { name: "Renamed" }, token);
+    assert(r.status === 200 && r.json.name === "Renamed", "rename failed");
+    const other = await req("PATCH", "/api/songs/" + songId, { name: "Hacked" }, token2);
+    assert(other.status === 404, "cross-user patch should 404");
   });
 
-  await t("playlists: rename", async () => {
-    const r = await req("PUT", "/api/playlists/" + pid, { name: "renamed" }, token);
-    assert(r.status === 200, "rename failed");
-    const g = await req("GET", "/api/playlists/" + pid, null, token);
-    assert(g.json.playlist.name === "renamed", "rename not applied");
+  await t("songs: audio stream 200 + 206 range, auth required", async () => {
+    const noAuth = await req("GET", `/api/songs/${songId}/audio`);
+    assert(noAuth.status === 401, "audio without token should 401, got " + noAuth.status);
+    const full = await fetch(`http://127.0.0.1:${PORT}/api/songs/${songId}/audio?token=${token}`);
+    assert(full.status === 200, "audio 200 failed: " + full.status);
+    assert(full.headers.get("accept-ranges") === "bytes", "missing accept-ranges");
+    const buf = Buffer.from(await full.arrayBuffer());
+    assert(buf.length === 9000, "full body wrong length: " + buf.length);
+    const part = await fetch(`http://127.0.0.1:${PORT}/api/songs/${songId}/audio?token=${token}`,
+      { headers: { Range: "bytes=0-99" } });
+    assert(part.status === 206, "range should 206, got " + part.status);
+    assert(part.headers.get("content-range") === "bytes 0-99/9000", "bad content-range");
+    const pbuf = Buffer.from(await part.arrayBuffer());
+    assert(pbuf.length === 100, "range body wrong length");
   });
 
-  await t("playlists: add tracks, no dupes", async () => {
-    const t2 = { ...track, id: "it:2", title: "two" };
-    await req("POST", `/api/playlists/${pid}/tracks`, { track }, token);
-    await req("POST", `/api/playlists/${pid}/tracks`, { track: t2 }, token);
-    await req("POST", `/api/playlists/${pid}/tracks`, { track }, token); // re-add → moves to end
-    const g = await req("GET", "/api/playlists/" + pid, null, token);
-    const ids = g.json.playlist.tracks.map((x) => x.id);
-    assert(ids.length === 2 && ids[0] === "it:2" && ids[1] === "it:1", "dupe rule broken: " + ids);
+  await t("songs: delete removes doc", async () => {
+    const other = await req("DELETE", "/api/songs/" + songId, null, token2);
+    assert(other.status === 404, "cross-user delete should 404");
+    const r = await req("DELETE", "/api/songs/" + songId, null, token);
+    assert(r.status === 200 && r.json.ok, "delete failed");
+    const g = await req("GET", "/api/songs/" + songId, null, token);
+    assert(g.status === 404, "song should be gone");
   });
 
-  await t("playlists: reorder", async () => {
-    const r = await req("PUT", `/api/playlists/${pid}/tracks/reorder`, { trackId: "it:1", toIndex: 0 }, token);
-    assert(r.status === 200, "reorder failed");
-    const g = await req("GET", "/api/playlists/" + pid, null, token);
-    assert(g.json.playlist.tracks[0].id === "it:1", "reorder not applied");
-  });
-
-  await t("playlists: remove track + delete", async () => {
-    await req("DELETE", `/api/playlists/${pid}/tracks/it:2`, null, token);
-    let g = await req("GET", "/api/playlists/" + pid, null, token);
-    assert(g.json.playlist.tracks.length === 1, "remove failed");
-    await req("DELETE", "/api/playlists/" + pid, null, token);
-    g = await req("GET", "/api/playlists/" + pid, null, token);
-    assert(g.status === 404, "delete failed");
-  });
-
-  await t("playlists: bad id → 400", async () => {
-    const r = await req("GET", "/api/playlists/not-an-objectid", null, token);
+  await t("songs: bad id → 400", async () => {
+    const r = await req("GET", "/api/songs/not-an-objectid", null, token);
     assert(r.status === 400, "want 400, got " + r.status);
   });
 
-  await t("history: threshold + dedup", async () => {
-    let r = await req("POST", "/api/history", { track, playedSec: 5 }, token);
-    assert(r.json.recorded === false, "5s should not record");
-    r = await req("POST", "/api/history", { track, playedSec: 40 }, token);
-    assert(r.json.recorded === true, "40s should record");
-    r = await req("POST", "/api/history", { track, playedSec: 40 }, token);
-    assert(r.json.deduped === true, "second play within hour should dedup");
-    const g = await req("GET", "/api/history", null, token);
-    assert(g.json.tracks.length === 1, "history count wrong");
+  await t("drive status (stubbed)", async () => {
+    const r = await req("GET", "/api/drive/status", null, token);
+    assert(r.status === 200 && r.json.connected === true, "drive status wrong");
   });
 
   await t("preferences: defaults + validation", async () => {
@@ -158,7 +192,7 @@ async function main() {
     assert(bad.status === 400, "want 400 for missing prefs");
   });
 
-  await t("search: itunes fallback shape", async () => {
+  await t("search: metadata-only shape (no audio fields)", async () => {
     try {
       const r = await req("GET", "/api/search?q=coldplay%20yellow");
       assert(r.status === 200 && Array.isArray(r.json.tracks) && r.json.tracks.length > 0, "no tracks");
@@ -166,7 +200,7 @@ async function main() {
       for (const k of ["id", "title", "artist", "album", "albumArt", "duration", "source"]) {
         assert(k in t0, "missing key " + k);
       }
-      assert(["itunes", "spotify"].includes(r.json.source), "bad source");
+      assert(!("previewUrl" in t0) && !("audioAvailable" in t0), "audio fields leaked into search");
     } catch (e) {
       if (e.message.includes("fetch failed")) { skipped++; results.push("skip search (no network)"); return; }
       throw e;
@@ -182,6 +216,13 @@ async function main() {
     } catch (e) {
       if (e.message.includes("fetch failed")) { skipped++; results.push("skip lyrics (no network)"); return; }
       throw e;
+    }
+  });
+
+  await t("removed provider routes are gone", async () => {
+    for (const p of ["/api/audio/xyz", "/api/audio/debug/xyz", "/api/liked", "/api/playlists", "/api/history", "/api/track/1"]) {
+      const r = await req("GET", p, null, token);
+      assert(r.status === 404, `${p} should 404, got ${r.status}`);
     }
   });
 

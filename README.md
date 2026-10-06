@@ -1,6 +1,7 @@
 # play backend
 
-API server for [yoshik.xyz/play](https://yoshik.xyz/play) — a minimal personal music player.
+API server for [yoshik.xyz/play](https://yoshik.xyz/play) — a private, uploads-only
+personal music library.
 
 ## architecture
 
@@ -8,17 +9,22 @@ API server for [yoshik.xyz/play](https://yoshik.xyz/play) — a minimal personal
 frontend (static, yoshik.xyz/play)
     ↓ HTTPS
 express api (this repo, render)
-    ├── auth: google id token → JWT
-    ├── music metadata: spotify web api (client credentials) → itunes search api fallback
-    ├── audio: yt-dlp download → streamed once → tmp deleted (never stored server-side)
-    ├── lyrics: lrcmux (word-level) → lrclib (line-level)
-    └── user library: mongodb (users, playlists, liked, play_history, user_preferences)
+    ├── auth: google id token → JWT (every /api route gated)
+    ├── drive: Yoshik's Google Drive, folder "yoshik-play", backend only
+    │         (app-level refresh token in mongo app_config — never per-user)
+    ├── songs: mongodb metadata (name, drive file id, duration, artwork match)
+    ├── audio: streams from Drive with Range support, chunk-by-chunk —
+    │         the whole file is never loaded into memory
+    ├── search: spotify → itunes fallback, METADATA ONLY (names/artwork for
+    │         the upload matcher — never audio)
+    ├── lyrics: lrcmux (word-level) → lrclib (line-level), by name + duration
+    └── preferences: mongodb (volume/shuffle/repeat/motion)
 ```
 
-Audio is deliberately transient on the server: `GET /api/getmp3` downloads the mp3 to a
-tmp dir, streams it to the client, then deletes it. The frontend caches the bytes in
-IndexedDB (never localStorage) with LRU eviction. Nothing copyrighted is stored or
-redistributed by the server.
+There is no YouTube, SoundCloud, yt-dlp, or any third-party audio fetching
+anywhere in this codebase. Uploads are the only audio source; they land in
+Yoshik's Drive and stream back through the API with the user's JWT
+(`Authorization` header, or `?token=` for the `<audio>` element).
 
 ## local setup
 
@@ -28,7 +34,7 @@ cp .env.example .env   # fill in values
 node server.js
 ```
 
-Needs: node 18+, python3, `yt-dlp` (`pip install yt-dlp`), `ffmpeg` (for mp3 conversion).
+Needs: node 18+. No python, no ffmpeg, no yt-dlp.
 
 ## environment variables
 
@@ -37,42 +43,44 @@ Needs: node 18+, python3, `yt-dlp` (`pip install yt-dlp`), `ffmpeg` (for mp3 con
 | `MONGODB_URI` | yes | atlas connection string |
 | `JWT_SECRET` | yes | long random string |
 | `GOOGLE_CLIENT_ID` | yes | google cloud oauth client id |
-| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | no | spotify metadata; without these the itunes fallback serves search |
+| `GOOGLE_CLIENT_SECRET` | yes | needed for the oauth code exchanges (login + drive) |
+| `DRIVE_REFRESH_TOKEN` | no | local-dev override; production reads mongo `app_config` |
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | no | spotify metadata for the upload matcher; without these the itunes fallback serves search |
 | `MONGO_DB` | no | default `play` |
 | `PORT` | no | default 3000 |
 | `CORS_ORIGIN` | no | comma-separated allowed origins |
+
+Drive connect: settings → "connect drive" opens a Google consent page
+(`access_type=offline`, `prompt=consent`, `drive.file` scope); the returned code
+is posted to `POST /api/drive/reconnect`, which stores the refresh token in
+`app_config`. Reconnect any time from the same button.
 
 ## api
 
 | method | route | auth | notes |
 |---|---|---|---|
-| GET | `/health` | no | |
-| GET | `/api/search?q=` | no | spotify → itunes fallback |
-| GET | `/api/track/:id` | no | |
-| GET | `/api/album/:id` | no | |
-| GET | `/api/artist/:id` | no | |
-| GET | `/api/getmp3?q=` | no | downloads + streams mp3, rate-limited |
-| GET | `/api/lyrics?artist=&title=&duration=` | no | |
+| GET | `/health` | no | deps: db, drive, lrcmux, lrclib |
+| GET | `/api/search?q=` | no | spotify → itunes fallback, metadata only |
+| GET | `/api/lyrics?artist=&title=&duration=` | no | lrcmux → lrclib |
 | POST | `/api/auth/google` | no | `{credential}` → `{token, user}` |
+| POST | `/api/auth/google/code` | no | redirect flow (ios) `{code, redirectUri}` |
 | GET | `/api/me` | yes | session check |
-| GET/POST | `/api/liked` | yes | upsert = duplicate-safe |
-| DELETE | `/api/liked/:id` | yes | |
-| GET/POST | `/api/playlists` | yes | |
-| GET/PUT/DELETE | `/api/playlists/:id` | yes | rename included |
-| POST | `/api/playlists/:id/tracks` | yes | re-adding moves track to end (no dupes) |
-| PUT | `/api/playlists/:id/tracks/reorder` | yes | `{trackId, toIndex}` |
-| DELETE | `/api/playlists/:id/tracks/:trackId` | yes | |
-| POST/GET | `/api/history` | yes | records ≥30s or ≥50% plays, deduped per hour |
+| GET | `/api/drive/status` | yes | backend drive connectivity |
+| POST | `/api/drive/reconnect` | yes | `{code, redirectUri}` stores refresh token |
+| POST | `/api/songs` | yes | multipart `audio` + `duration`/`name` → Drive |
+| GET | `/api/songs` | yes | my songs, newest first |
+| GET | `/api/songs/:id` | yes | ownership enforced |
+| PATCH | `/api/songs/:id` | yes | rename / artwork match |
+| DELETE | `/api/songs/:id` | yes | deletes from Drive + mongo |
+| GET | `/api/songs/:id/audio` | yes | Range streaming from Drive |
+| POST | `/api/songs/:id/lyrics/refresh` | yes | re-fetch lrcmux → lrclib |
 | GET/PUT | `/api/preferences` | yes | volume/shuffle/repeat/motion |
-
-Track ids are namespaced: `sp:<id>` (spotify) or `it:<id>` (itunes); albums `sp:al:`/`it:al:`, artists `sp:ar:`/`it:ar:`.
 
 ## deployment (render)
 
-- build command: `npm install`
+- build command: `./render-build.sh` (node deps only)
 - start command: `node server.js`
-- add a `render.yaml` or set env vars in the dashboard
-- needs python3 + ffmpeg on the host (`apt` via render's native envs works; for docker add them to the image)
+- set env vars in the dashboard (see table above)
 
 ## testing
 
@@ -80,14 +88,16 @@ Track ids are namespaced: `sp:<id>` (spotify) or `it:<id>` (itunes); albums `sp:
 node test/run.js
 ```
 
-Spins up the app with an in-memory mongo stub and exercises: health, auth middleware
-(401s), likes duplicate-prevention, playlist CRUD + reorder + rename, history
-threshold/dedup, preferences validation, search fallback, lyrics shape.
+Spins up the app with in-memory mongo + drive stubs and exercises: health, auth
+middleware (401s), song upload/list/get/patch/delete with ownership checks,
+audio streaming (200 + 206 range, auth required), drive status, preferences
+validation, search metadata-only shape, lyrics shape, and 404s for every
+removed provider route.
 
 ## security notes
 
-- secrets only via env vars, never in code
-- helmet headers, express-rate-limit (stricter on `/api/getmp3`)
+- secrets only via env vars (or mongo `app_config` for the drive token), never in code
+- helmet headers, express-rate-limit (stricter on upload + stream routes)
 - all user input length-capped and ObjectIds validated
-- track objects are allow-list filtered (`cleanTrack`) before db writes
+- uploads land on disk (`multer` diskStorage) and stream to Drive — never fully in memory
 - request log records method/path/status only — no tokens, no bodies
