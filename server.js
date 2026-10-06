@@ -169,19 +169,6 @@ app.get("/api/me", authRequired, (req, res) => {
 app.get("/api/drive/status", authRequired, async (req, res) => {
   res.json({ connected: await drive.checkConnection(), folder: drive.FOLDER_NAME });
 });
-/* one-time / reconnect: exchange an offline drive.file code, store refresh token */
-app.post("/api/drive/reconnect", authRequired, async (req, res) => {
-  try {
-    const code = str(req.body.code, 2000);
-    const redirectUri = str(req.body.redirectUri, 500);
-    if (!code || !redirectUri) return res.status(400).json({ error: "code and redirectUri required" });
-    await drive.saveRefreshToken(code, redirectUri);
-    res.json({ ok: true, connected: true });
-  } catch (e) {
-    console.log("drive reconnect failed:", e.message);
-    res.status(500).json({ error: "drive reconnect failed: " + e.message.slice(0, 120) });
-  }
-});
 
 /* ---------- songs: personal library ---------- */
 const songsColl = () => getDb().collection("songs");

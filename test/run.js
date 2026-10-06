@@ -220,10 +220,13 @@ async function main() {
   });
 
   await t("removed provider routes are gone", async () => {
-    for (const p of ["/api/audio/xyz", "/api/audio/debug/xyz", "/api/liked", "/api/playlists", "/api/history", "/api/track/1"]) {
+    for (const p of ["/api/audio/xyz", "/api/audio/debug/xyz", "/api/liked", "/api/playlists", "/api/history", "/api/track/1", "/api/drive/reconnect"]) {
       const r = await req("GET", p, null, token);
       assert(r.status === 404, `${p} should 404, got ${r.status}`);
     }
+    // reconnect must not accept POST either
+    const pr = await req("POST", "/api/drive/reconnect", { code: "x", redirectUri: "y" }, token);
+    assert(pr.status === 404, `POST /api/drive/reconnect should 404, got ${pr.status}`);
   });
 
   await t("404 json", async () => {
