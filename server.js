@@ -116,7 +116,7 @@ app.get("/api/search", searchLimit, async (req, res) => {
   }
 });
 
-/* ---------- lyrics: lrcmux -> lrclib, matched by name + duration ---------- */
+/* ---------- lyrics: lrcmux -> lrclib, matched by name + artist ---------- */
 app.get("/api/lyrics", async (req, res) => {
   const artist = str(req.query.artist), title = str(req.query.title);
   if (!title) return res.status(400).json({ error: "title required" });
